@@ -11,7 +11,7 @@
 {-# LANGUAGE UndecidableInstances #-}
 
 module Database.Beam.Postgres.Transaction
-    ( TransactionT, Transaction, transaction
+    ( TransactionT, Transaction, transaction, savepoint
     , Run, none, one, only, many, some
     , Table, Select, Insert, Upsert, Update, Where, Projection
     , Q, QM, QE, QT, QIn, QOut, QEOut, QEq
@@ -27,8 +27,8 @@ where
 -- base ----------------------------------------------------------------------
 import           Control.Applicative (Alternative)
 import           Control.Applicative (liftA2)
-import           Control.Exception (Exception, SomeException)
-import           Control.Monad (MonadPlus, unless)
+import           Control.Exception (Exception)
+import           Control.Monad (MonadPlus, unless, when)
 import           Control.Monad.Fail (MonadFail)
 import           Control.Monad.Fix (MonadFix)
 import           Control.Monad.IO.Class (MonadIO)
@@ -95,7 +95,7 @@ import           Control.Monad.Lift
 import           Control.Monad.Lift.IO (liftIO)
 import           Monad.Catch (MonadCatch, catch, handle)
 import           Monad.Mask (MonadMask, mask)
-import           Monad.Recover (MonadRecover, onException, recover)
+import           Monad.Recover (onException)
 import           Monad.ST (MonadST, newRef, readRef, writeRef)
 import           Monad.Throw (MonadThrow, throw)
 import           Monad.Try (MonadTry, finally)
@@ -121,7 +121,7 @@ instance Exception RecordNotFound
 
 
 ------------------------------------------------------------------------------
-bracket :: (MonadST v m, MonadMask m, MonadTry m, MonadCatch m)
+bracket :: (MonadInner IO m, MonadST v m, MonadMask m, MonadTry m, MonadCatch m)
     => m a -> (a -> m ()) -> (a -> m ()) -> (a -> m b) -> m b
 bracket acquire onFailure onSuccess run = mask $ \unmask -> do
     resource <- acquire
@@ -131,18 +131,38 @@ bracket acquire onFailure onSuccess run = mask $ \unmask -> do
             onFailure resource `finally` writeRef ref True
         `finally` do
             finished <- readRef ref
-            unless finished $ liftI $ onSuccess resource
+            unless finished $ onSuccess resource
 
 
 ------------------------------------------------------------------------------
-transaction
-    :: (MonadInner IO m, MonadST v m, MonadMask m, MonadTry m, MonadCatch m)
+transaction ::
+    ( MonadInner IO m, MonadST v m, MonadMask m, MonadTry m, MonadCatch m
+    )
     => TransactionT m a -> Connection -> m a
 transaction (TransactionT (ReaderT f)) connection =
     bracket (liftI acquire) (liftI . rollback_) (liftI . commit) f
   where
     acquire = beginMode defaultTransactionMode connection >> pure connection
     rollback_ = handle (\(_ :: IOError) -> return ()) . rollback
+
+
+------------------------------------------------------------------------------
+savepoint ::
+    ( MonadInner IO m, MonadST v m, MonadMask m, MonadCatch m, MonadTry m
+    )
+    => TransactionT m a -> TransactionT m a
+savepoint (TransactionT (ReaderT f)) = TransactionT $ ReaderT go
+  where
+    go connection = bracket acquire onFailure onSuccess (const run)
+      where
+        run = f connection
+        acquire = liftI $ newSavepoint connection
+        onFailure = liftI . rollbackToAndReleaseSavepoint connection
+        onSuccess savepoint_ = liftI $ do
+            releaseSavepoint connection savepoint_ `catch` \e -> do
+                when (isFailedTransactionError e) $
+                    rollbackToAndReleaseSavepoint connection savepoint_
+                throw e
 
 
 ------------------------------------------------------------------------------
@@ -170,31 +190,6 @@ instance MonadTransControl TransactionT where
 ------------------------------------------------------------------------------
 type instance LayerResult TransactionT = LayerResult (ReaderT Connection)
 type instance LayerState TransactionT = LayerState (ReaderT Connection)
-
-
-------------------------------------------------------------------------------
-instance
-    ( MonadInner IO m, MonadST v m, MonadMask m, MonadCatch m, MonadTry m
-    )
-  =>
-    MonadRecover SomeException (TransactionT m)
-  where
-    recover (TransactionT (ReaderT f)) handler = TransactionT $ ReaderT go
-      where
-        go connection = run `recover` handler'
-          where
-            run = bracket acquire onFailure onSuccess (const (f connection))
-            acquire = liftI $ newSavepoint connection
-            onFailure = liftI . rollbackToAndReleaseSavepoint connection
-            onSuccess savepoint = liftI $ do
-                releaseSavepoint connection savepoint `catch` \e ->
-                    if isFailedTransactionError e
-                        then
-                            rollbackToAndReleaseSavepoint connection savepoint
-                        else throw e
-            handler' e = g connection
-              where
-                TransactionT (ReaderT g) = handler e
 
 
 ------------------------------------------------------------------------------
