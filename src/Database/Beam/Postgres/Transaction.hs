@@ -1,10 +1,7 @@
 {-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -39,25 +36,28 @@ import           Data.Int (Int64)
 import           Data.Proxy (Proxy (Proxy))
 import           Data.Semigroup (Semigroup, (<>))
 import           Data.Typeable (Typeable)
-import           Data.Void (Void)
 import           GHC.Generics (Generic, Generic1, Rep)
-import           Unsafe.Coerce (unsafeCoerce)
 
 
 -- beam-core -----------------------------------------------------------------
 import           Database.Beam.Backend (FromBackendRow)
 import           Database.Beam.Query
-                     ( QExpr, QExprToIdentity, QGenExpr, QValueContext
+                     ( QAssignment, QBaseScope, QExpr, QExprToIdentity
+                     , QField, QGenExpr, QValueContext
                      , HaskellLiteralForQExpr
+                     , Projectible
                      , SqlEq, SqlInsertValues, SqlValable, SqlValableTable
                      , (==.), aggregate_, countAll_, val_
                      )
+import           Database.Beam.Query.Internal (QNested)
+{-
 import           Database.Beam.Query.Internal
                      ( AnyType
                      , ProjectibleInSelectSyntax
                      , ProjectibleWithPredicate
                      , QAssignment, QField, QNested
                      )
+-}
 import qualified Database.Beam.Query as B
 import           Database.Beam.Schema
                      ( Beamable, DatabaseEntity, TableEntity, PrimaryKey, pk
@@ -70,11 +70,7 @@ import           Database.Beam.Postgres (Postgres)
 import qualified Database.Beam.Postgres.Conduit as P
 import           Database.Beam.Postgres.Full (PgInsertOnConflict)
 import qualified Database.Beam.Postgres.Full as P
-import           Database.Beam.Postgres.Syntax
-                     ( PgExpressionSyntax, PgFieldNameSyntax
-                     , PgInsertValuesSyntax
-                     , PgSelectSyntax
-                     )
+import           Database.Beam.Postgres.Syntax (PostgresInaccessible)
 
 
 -- conduit -------------------------------------------------------------------
@@ -248,11 +244,11 @@ type Q db s t = QM db s (QT s t)
 
 
 ------------------------------------------------------------------------------
-type QM db s = B.Q PgSelectSyntax db s
+type QM db s = B.Q Postgres db s
 
 
 ------------------------------------------------------------------------------
-type QE = QExpr PgExpressionSyntax
+type QE = QExpr Postgres
 
 
 ------------------------------------------------------------------------------
@@ -264,19 +260,15 @@ type QIn p a = (a ~ HaskellLiteralForQExpr p, SqlValable p)
 
 
 ------------------------------------------------------------------------------
-type QOut p a =
-    ( ProjectibleInSelectSyntax PgSelectSyntax p
-    , a ~ QExprToIdentity p
-    , FromBackendRow Postgres a
-    )
+type QOut p a = (QEOut p, a ~ QExprToIdentity p, FromBackendRow Postgres a)
 
 
 ------------------------------------------------------------------------------
-type QEOut = ProjectibleWithPredicate AnyType PgExpressionSyntax
+type QEOut = Projectible Postgres
 
 
 ------------------------------------------------------------------------------
-type QEq s = SqlEq (QGenExpr QValueContext PgExpressionSyntax s)
+type QEq s = SqlEq (QGenExpr QValueContext Postgres s)
 
 
 ------------------------------------------------------------------------------
@@ -284,7 +276,7 @@ type Table db table = DatabaseEntity Postgres db (TableEntity table)
 
 
 ------------------------------------------------------------------------------
-type Projection table p = QT Void table -> p
+type Projection table p = QT PostgresInaccessible table -> p
 
 
 ------------------------------------------------------------------------------
@@ -292,7 +284,7 @@ type Select db s = QM db s
 
 
 ------------------------------------------------------------------------------
-type Insert table s = SqlInsertValues PgInsertValuesSyntax (table (QE s))
+type Insert table s = SqlInsertValues Postgres (table (QE s))
 
 
 ------------------------------------------------------------------------------
@@ -300,8 +292,7 @@ type Upsert = PgInsertOnConflict
 
 
 ------------------------------------------------------------------------------
-type Update table = forall s.
-    table (QField s) -> [QAssignment PgFieldNameSyntax PgExpressionSyntax s]
+type Update table = forall s. table (QField s) -> QAssignment Postgres s
 
 
 ------------------------------------------------------------------------------
@@ -309,14 +300,14 @@ type Where table = forall s. QT s table -> QE s Bool
 
 
 ------------------------------------------------------------------------------
-select :: QOut p a => Run m f -> Select db Void p -> TransactionT m (f a)
+select :: QOut p a => Run m f -> Select db QBaseScope p -> TransactionT m (f a)
 select run q = TransactionT $ ReaderT $ \connection -> run $
-    P.runSelect connection (B.select (inaccessible q))
+    P.runSelect connection (B.select q)
 
 
 ------------------------------------------------------------------------------
 count :: (MonadInner IO m, MonadThrow m, QEOut p)
-    => Select db (QNested Void) p -> TransactionT m Word
+    => Select db (QNested QBaseScope) p -> TransactionT m Word
 count = fmap (fromIntegral . runIdentity) . select only
     . aggregate_ (const countAll_)
 
@@ -334,9 +325,8 @@ insert table as = TransactionT $ ReaderT $ \connection -> liftIO $
 insertReturning :: QOut p a
     => Run m f -> Table db table -> Insert table s -> Projection table p
     -> TransactionT m (f a)
-insertReturning run table as f = TransactionT . ReaderT $ \connection ->
-    run $ P.runInsertReturning connection $ P.insertReturning table as u
-        (Just (f . inaccessibleT))
+insertReturning run table as f = TransactionT . ReaderT $ \connection -> run $
+    P.runInsertReturning connection $ P.insertReturning table as u (Just f)
   where
     u = P.onConflictDefault
 
@@ -353,29 +343,28 @@ upsert table as u = TransactionT $ ReaderT $ \connection -> liftIO $
 upsertReturning :: QOut p a
     => Run m f -> Table db table -> Insert table s -> Projection table p
     -> Upsert table -> TransactionT m (f a)
-upsertReturning run table as f u = TransactionT . ReaderT $ \connection ->
-    run $ P.runInsertReturning connection $ P.insertReturning table as u
-        (Just (f . inaccessibleT))
+upsertReturning run table as f u = TransactionT . ReaderT $ \connection -> run
+    $ P.runInsertReturning connection $ P.insertReturning table as u (Just f)
 
 
 ------------------------------------------------------------------------------
 type HasPrimaryKeyEquality table =
     ( Generic (PrimaryKey table
-        (B.WithConstraint (B.HasSqlEqualityCheck PgExpressionSyntax)))
+        (B.WithConstraint (B.HasSqlEqualityCheck Postgres)))
     , B.GFieldsFulfillConstraint
-        (B.HasSqlEqualityCheck PgExpressionSyntax)
-        (Rep (PrimaryKey table B.Exposed))
-        (Rep (PrimaryKey table Identity))
-        (Rep (PrimaryKey table
-            (B.WithConstraint (B.HasSqlEqualityCheck PgExpressionSyntax))))
+        (B.HasSqlEqualityCheck Postgres)
+            (Rep (PrimaryKey table B.Exposed))
+            (Rep (PrimaryKey table Identity))
+            (Rep (PrimaryKey table
+                (B.WithConstraint (B.HasSqlEqualityCheck Postgres))))
     )
 
 
 ------------------------------------------------------------------------------
 save ::
     ( MonadInner IO m, B.Table table
-    , SqlValableTable (PrimaryKey table) PgExpressionSyntax
-    , SqlValableTable table PgExpressionSyntax
+    , SqlValableTable Postgres (PrimaryKey table)
+    , SqlValableTable Postgres table
     , HasPrimaryKeyEquality table
     )
     => Table db table -> table Identity -> TransactionT m Int64
@@ -385,8 +374,7 @@ save table row = TransactionT $ ReaderT $ \connection -> liftIO $
 
 ------------------------------------------------------------------------------
 update :: (MonadInner IO m, Beamable table)
-    => Table db table -> Update table -> Where table
-    -> TransactionT m Int64
+    => Table db table -> Update table -> Where table -> TransactionT m Int64
 update table u w = TransactionT $ ReaderT $ \connection -> liftIO $ do
     P.runUpdate connection $ B.update table u w
 
@@ -396,14 +384,13 @@ updateReturning :: QOut p a
     => Run m f -> Table db table -> Update table -> Where table
     -> Projection table p -> TransactionT m (f a)
 updateReturning run table u w f = TransactionT . ReaderT $ \connection ->
-    run $ P.runUpdateReturning connection $ P.updateReturning table u w
-        (f . inaccessibleT)
+    run $ P.runUpdateReturning connection $ P.updateReturning table u w f
 
 
 ------------------------------------------------------------------------------
 forget ::
     ( MonadInner IO m, B.Table table
-    , SqlValableTable (PrimaryKey table) PgExpressionSyntax
+    , SqlValableTable Postgres (PrimaryKey table)
     , HasPrimaryKeyEquality table
     )
     => Table db table -> PrimaryKey table Identity -> TransactionT m Int64
@@ -422,16 +409,4 @@ deleteReturning :: QOut p a
     => Run m f -> Table db table -> Where table -> Projection table p
     -> TransactionT m (f a)
 deleteReturning run table w f = TransactionT . ReaderT $ \connection -> run $
-    P.runDeleteReturning connection $ P.deleteReturning table w
-        (f . inaccessibleT)
-
-
-------------------------------------------------------------------------------
-inaccessible :: QM db Void a -> QM db s a
-inaccessible = unsafeCoerce
-
-
-------------------------------------------------------------------------------
-inaccessibleT :: QT s t -> QT Void t
-inaccessibleT = unsafeCoerce
-
+    P.runDeleteReturning connection $ P.deleteReturning table w f
