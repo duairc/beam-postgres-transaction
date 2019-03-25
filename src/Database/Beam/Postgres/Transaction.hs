@@ -300,20 +300,21 @@ type Where table = forall s. QT s table -> QE s Bool
 
 
 ------------------------------------------------------------------------------
-select :: QOut p a => Run m f -> Select db QBaseScope p -> TransactionT m (f a)
+select :: forall db a f m p. QOut p a
+    => Run m f -> Select db QBaseScope p -> TransactionT m (f a)
 select run q = TransactionT $ ReaderT $ \connection -> run $
     P.runSelect connection (B.select q)
 
 
 ------------------------------------------------------------------------------
-count :: (MonadInner IO m, MonadThrow m, QEOut p)
+count :: forall db p m. (MonadInner IO m, MonadThrow m, QEOut p)
     => Select db (QNested QBaseScope) p -> TransactionT m Word
 count = fmap (fromIntegral . runIdentity) . select only
     . aggregate_ (const countAll_)
 
 
 ------------------------------------------------------------------------------
-insert :: (MonadInner IO m, Beamable table)
+insert :: forall db table m s. (MonadInner IO m, Beamable table)
     => Table db table -> Insert table s -> TransactionT m Int64
 insert table as = TransactionT $ ReaderT $ \connection -> liftIO $
     P.runInsert connection $ P.insert table as u
@@ -322,7 +323,7 @@ insert table as = TransactionT $ ReaderT $ \connection -> liftIO $
 
 
 ------------------------------------------------------------------------------
-insertReturning :: QOut p a
+insertReturning :: forall db table a f m p s. QOut p a
     => Run m f -> Table db table -> Insert table s -> Projection table p
     -> TransactionT m (f a)
 insertReturning run table as f = TransactionT . ReaderT $ \connection -> run $
@@ -332,7 +333,7 @@ insertReturning run table as f = TransactionT . ReaderT $ \connection -> run $
 
 
 ------------------------------------------------------------------------------
-upsert :: (MonadInner IO m, Beamable table)
+upsert :: forall db table m s. (MonadInner IO m, Beamable table)
     => Table db table -> Insert table s -> Upsert table
     -> TransactionT m Int64
 upsert table as u = TransactionT $ ReaderT $ \connection -> liftIO $
@@ -340,7 +341,7 @@ upsert table as u = TransactionT $ ReaderT $ \connection -> liftIO $
 
 
 ------------------------------------------------------------------------------
-upsertReturning :: QOut p a
+upsertReturning :: forall db table a f m p s. QOut p a
     => Run m f -> Table db table -> Insert table s -> Projection table p
     -> Upsert table -> TransactionT m (f a)
 upsertReturning run table as f u = TransactionT . ReaderT $ \connection -> run
@@ -361,7 +362,7 @@ type HasPrimaryKeyEquality table =
 
 
 ------------------------------------------------------------------------------
-save ::
+save :: forall db table m.
     ( MonadInner IO m, B.Table table
     , SqlValableTable Postgres (PrimaryKey table)
     , SqlValableTable Postgres table
@@ -373,14 +374,14 @@ save table row = TransactionT $ ReaderT $ \connection -> liftIO $
 
 
 ------------------------------------------------------------------------------
-update :: (MonadInner IO m, Beamable table)
+update :: forall db table m. (MonadInner IO m, Beamable table)
     => Table db table -> Update table -> Where table -> TransactionT m Int64
 update table u w = TransactionT $ ReaderT $ \connection -> liftIO $ do
     P.runUpdate connection $ B.update table u w
 
 
 ------------------------------------------------------------------------------
-updateReturning :: QOut p a
+updateReturning :: forall db table a f m p. QOut p a
     => Run m f -> Table db table -> Update table -> Where table
     -> Projection table p -> TransactionT m (f a)
 updateReturning run table u w f = TransactionT . ReaderT $ \connection ->
@@ -388,7 +389,7 @@ updateReturning run table u w f = TransactionT . ReaderT $ \connection ->
 
 
 ------------------------------------------------------------------------------
-forget ::
+forget :: forall db table m.
     ( MonadInner IO m, B.Table table
     , SqlValableTable Postgres (PrimaryKey table)
     , HasPrimaryKeyEquality table
@@ -398,14 +399,14 @@ forget table id_ = delete table ((==. val_ id_) . pk)
 
 
 ------------------------------------------------------------------------------
-delete :: MonadInner IO m => Table db table -> Where table
+delete :: forall db table m. MonadInner IO m => Table db table -> Where table
     -> TransactionT m Int64
 delete table w = TransactionT . ReaderT $ \connection -> liftIO $
     P.runDelete connection (B.delete table w)
 
 
 ------------------------------------------------------------------------------
-deleteReturning :: QOut p a
+deleteReturning :: forall db table a f m p. QOut p a
     => Run m f -> Table db table -> Where table -> Projection table p
     -> TransactionT m (f a)
 deleteReturning run table w f = TransactionT . ReaderT $ \connection -> run $
